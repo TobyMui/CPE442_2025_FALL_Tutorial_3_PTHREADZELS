@@ -16,6 +16,7 @@ struct Shared {
     cv::Mat* gy = nullptr;
     int rows = 0, cols = 0;
 
+    // what on earth does this do?
     std::atomic<Pass> pass{Pass::STOP};
 
     // two rendezvous points: start (kick off work) and end (work finished)
@@ -28,6 +29,8 @@ struct ThreadCtx {
     int tid = 0; // 0..NUM_THREADS-1
 };
 
+// takes in the gray Mat of size SIZE, stores everything in dst of size SIZE - 2
+// K is kernel, y0 is start, y1 is end
 static inline void convolve3x3_rowptr(const cv::Mat& src, cv::Mat& dst,
                                       const float K[9], int y0, int y1)
 {
@@ -43,6 +46,7 @@ static inline void convolve3x3_rowptr(const cv::Mat& src, cv::Mat& dst,
         float* out = dst.ptr<float>(y);
 
         for (int x = offset; x < cols - offset; ++x) {
+            // manual convolution
             float sum =
                 ym1[x-1]*K[0] + ym1[x]*K[1] + ym1[x+1]*K[2] +
                 y0p[x-1]*K[3] + y0p[x]*K[4] + y0p[x+1]*K[5] +
@@ -52,11 +56,13 @@ static inline void convolve3x3_rowptr(const cv::Mat& src, cv::Mat& dst,
     }
 }
 
+// Why not a matrix?
 static float SOBEL_X[9] = { -1,0,1, -2,0,2, -1,0,1 };
 static float SOBEL_Y[9] = { -1,-2,-1, 0,0,0, 1,2,1 };
 
 void* worker(void* arg)
 {
+    // Creates a thread Struct and shares S with the thread struct
     ThreadCtx* C = static_cast<ThreadCtx*>(arg);
     Shared* S = C->S;
 
@@ -64,6 +70,7 @@ void* worker(void* arg)
         // 1) Wait for main to announce a pass (or STOP)
         pthread_barrier_wait(&S->start_barrier);
 
+        // atomically reads pass in S to prevent race conditions
         Pass p = S->pass.load(std::memory_order_acquire);
         if (p == Pass::STOP) break;
 
@@ -71,6 +78,7 @@ void* worker(void* arg)
         int rows = S->rows, cols = S->cols;
         int rows_per = (rows + NUM_THREADS - 1) / NUM_THREADS;
         int y0 = C->tid * rows_per;
+        // min is for if the y0 + rows_per is larger than  the image size
         int y1 = std::min(rows, y0 + rows_per);
 
         if (p == Pass::SOBEL_X) {
@@ -96,7 +104,9 @@ int main(int argc, char** argv)
     }
 
     cv::VideoCapture cap;
+    // if the first value is a number, it is a video capture
     if (std::isdigit(argv[1][0])) cap.open(std::stoi(argv[1]));
+    // otherwise it is a filename and opens file
     else cap.open(argv[1]);
 
     if (!cap.isOpened()) {
@@ -107,10 +117,13 @@ int main(int argc, char** argv)
     // We manage our own threading -> avoid oversubscription
     cv::setNumThreads(1);
 
+    // Why do we need +1 for main? The main shouldn't be meeting the barriers?
+    // we need +1 because the main thread sets the barriers, this allows us to load frames and set rows without removing the thread
     Shared S;
     pthread_barrier_init(&S.start_barrier, nullptr, NUM_THREADS + 1); // +1 for main
     pthread_barrier_init(&S.end_barrier,   nullptr, NUM_THREADS + 1);
 
+    // creates the threads and works on worker
     pthread_t threads[NUM_THREADS];
     ThreadCtx ctx[NUM_THREADS];
     for (int i = 0; i < NUM_THREADS; ++i) {
@@ -118,6 +131,7 @@ int main(int argc, char** argv)
         pthread_create(&threads[i], nullptr, worker, &ctx[i]);
     }
 
+    // creates windows
     cv::namedWindow("Gray",  cv::WINDOW_AUTOSIZE);
     cv::namedWindow("Sobel", cv::WINDOW_AUTOSIZE);
 
@@ -126,7 +140,14 @@ int main(int argc, char** argv)
     while (true) {
         if (!cap.read(frame) || frame.empty()) break;
 
+        // this may need to be converted to gray
+        // i can write the code if this is the case
         cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        // if the gx and gy frames are not set, create them
+        // gx is for the x convolution
+        // gy is for the y convolution
+        // mag32 if for the magnitude of both
 
         if (gx32f.size() != gray.size()) {
             gx32f.create(gray.size(), CV_32FC1);
@@ -171,7 +192,10 @@ int main(int argc, char** argv)
     pthread_barrier_wait(&S.start_barrier); // wake for STOP
     pthread_barrier_wait(&S.end_barrier);   // let them exit
 
+    // for every created thread, join until thread ends
     for (int i = 0; i < NUM_THREADS; ++i) pthread_join(threads[i], nullptr);
+
+    // cleans up the barriers
     pthread_barrier_destroy(&S.start_barrier);
     pthread_barrier_destroy(&S.end_barrier);
     return 0;
