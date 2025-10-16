@@ -1,125 +1,178 @@
+// sobel_barriers.cpp
 #include <opencv2/opencv.hpp>
+#include <pthread.h>
+#include <atomic>
 #include <iostream>
-#include <pthread.h> 
+#include <cctype>
+#include <algorithm>
 
-#define NUM_THREADS 4
+static const int NUM_THREADS = 4;
 
-pthreads_t threads[4]; 
+enum class Pass : int { SOBEL_X = 0, SOBEL_Y = 1, STOP = 2 };
 
- // Declare Sobel Kernels (X and Y)
- cv::Mat sobelX = (cv::Mat_<float>(3,3) <<
- -1, 0, 1,
- -2, 0, 2,
- -1, 0, 1);
+struct Shared {
+    const cv::Mat* gray = nullptr;
+    cv::Mat* gx = nullptr;
+    cv::Mat* gy = nullptr;
+    int rows = 0, cols = 0;
 
-cv::Mat sobelY = (cv::Mat_<float>(3,3) <<
- -1, -2, -1,
-  0,  0,  0,
-  1,  2,  1);
+    std::atomic<Pass> pass{Pass::STOP};
 
+    // two rendezvous points: start (kick off work) and end (work finished)
+    pthread_barrier_t start_barrier;
+    pthread_barrier_t end_barrier;
+};
 
-cv::Mat convolution(const cv::Mat& gray, const cv::Mat& kernel){
-    CV_Assert(gray.channels() == 1);
-    cv::Mat result(gray.rows, gray.cols, CV_32F, cv::Scalar(0));
+struct ThreadCtx {
+    Shared* S = nullptr;
+    int tid = 0; // 0..NUM_THREADS-1
+};
 
-    //Offset 
-    int offset = 1; 
+static inline void convolve3x3_rowptr(const cv::Mat& src, cv::Mat& dst,
+                                      const float K[9], int y0, int y1)
+{
+    const int offset = 1;
+    const int rows = src.rows, cols = src.cols;
+    const int ys = std::max(offset, y0);
+    const int ye = std::min(rows - offset, y1);
 
-    //Double for loop for traversing the 2d Matrix
-    for (int y = offset; y < gray.rows - offset; y++){
-        for(int x = offset; x < gray.cols - offset; x++){
-            float sum = 0.0f;
+    for (int y = ys; y < ye; ++y) {
+        const uchar* ym1 = src.ptr<uchar>(y - 1);
+        const uchar* y0p = src.ptr<uchar>(y);
+        const uchar* yp1 = src.ptr<uchar>(y + 1);
+        float* out = dst.ptr<float>(y);
 
-            //Apply the kernel 
-            for(int ky = 0; ky <= 2; ky++){
-                for(int kx = 0; kx <= 2; kx++){
-                    float pixel = static_cast<float>(gray.at<uchar>(y + ky, x + kx));
-                    float weight = kernel.at<float>(ky, kx); 
-                    sum += pixel * weight; 
-                }
-            }
-            result.at<float>(y,x) = sum; 
+        for (int x = offset; x < cols - offset; ++x) {
+            float sum =
+                ym1[x-1]*K[0] + ym1[x]*K[1] + ym1[x+1]*K[2] +
+                y0p[x-1]*K[3] + y0p[x]*K[4] + y0p[x+1]*K[5] +
+                yp1[x-1]*K[6] + yp1[x]*K[7] + yp1[x+1]*K[8];
+            out[x] = sum;
         }
     }
-    return result;
 }
 
-int main(int argc, char** argv) {
+static float SOBEL_X[9] = { -1,0,1, -2,0,2, -1,0,1 };
+static float SOBEL_Y[9] = { -1,-2,-1, 0,0,0, 1,2,1 };
 
-    std::cout << "Press esc or q to close the window! \n";
+void* worker(void* arg)
+{
+    ThreadCtx* C = static_cast<ThreadCtx*>(arg);
+    Shared* S = C->S;
 
-    if (argc < 2) {
-        std::cout << "Usage: " << argv[0] << " <video_path>" << std::endl;
-        return -1;
+    for (;;) {
+        // 1) Wait for main to announce a pass (or STOP)
+        pthread_barrier_wait(&S->start_barrier);
+
+        Pass p = S->pass.load(std::memory_order_acquire);
+        if (p == Pass::STOP) break;
+
+        // 2) Compute my slice for the announced pass
+        int rows = S->rows, cols = S->cols;
+        int rows_per = (rows + NUM_THREADS - 1) / NUM_THREADS;
+        int y0 = C->tid * rows_per;
+        int y1 = std::min(rows, y0 + rows_per);
+
+        if (p == Pass::SOBEL_X) {
+            convolve3x3_rowptr(*S->gray, *S->gx, SOBEL_X, y0, y1);
+        } else { // Pass::SOBEL_Y
+            convolve3x3_rowptr(*S->gray, *S->gy, SOBEL_Y, y0, y1);
+        }
+
+        // 3) Signal this pass is finished
+        pthread_barrier_wait(&S->end_barrier);
     }
 
+    // final rendezvous to let main join cleanly
+    pthread_barrier_wait(&S->end_barrier);
+    return nullptr;
+}
 
+int main(int argc, char** argv)
+{
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <video_path or camera index>\n";
+        return 1;
+    }
 
-    const std::string kWin = "Grayscale Video";
-
-    cv::VideoCapture cap(argv[1]);
+    cv::VideoCapture cap;
+    if (std::isdigit(argv[1][0])) cap.open(std::stoi(argv[1]));
+    else cap.open(argv[1]);
 
     if (!cap.isOpened()) {
-        std::cerr << "Error: Could not open video file." << std::endl;
-        return -1;
+        std::cerr << "Error: could not open source.\n";
+        return 1;
     }
 
-    cv::namedWindow(kWin, cv::WINDOW_AUTOSIZE);
-    cv::Mat frame, gray;
+    // We manage our own threading -> avoid oversubscription
+    cv::setNumThreads(1);
+
+    Shared S;
+    pthread_barrier_init(&S.start_barrier, nullptr, NUM_THREADS + 1); // +1 for main
+    pthread_barrier_init(&S.end_barrier,   nullptr, NUM_THREADS + 1);
+
+    pthread_t threads[NUM_THREADS];
+    ThreadCtx ctx[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        ctx[i] = ThreadCtx{ &S, i };
+        pthread_create(&threads[i], nullptr, worker, &ctx[i]);
+    }
+
+    cv::namedWindow("Gray",  cv::WINDOW_AUTOSIZE);
+    cv::namedWindow("Sobel", cv::WINDOW_AUTOSIZE);
+
+    cv::Mat frame, gray, gx32f, gy32f, mag32f, mag8u;
 
     while (true) {
-        if (!cap.read(frame) || frame.empty()) {
-            std::cout << "End of video." << std::endl;
-            break;
+        if (!cap.read(frame) || frame.empty()) break;
+
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        if (gx32f.size() != gray.size()) {
+            gx32f.create(gray.size(), CV_32FC1);
+            gy32f.create(gray.size(), CV_32FC1);
+            mag32f.create(gray.size(), CV_32FC1);
         }
+        gx32f.setTo(0);
+        gy32f.setTo(0);
 
-        // Manually convert to grayscale using CCIR 601 coefficients
-        gray.create(frame.rows, frame.cols, CV_8UC1);
-        for (int y = 0; y < frame.rows; y++) {
-            for (int x = 0; x < frame.cols; x++) {
-                cv::Vec3b color = frame.at<cv::Vec3b>(y, x);
-                uchar B = color[0];
-                uchar G = color[1];
-                uchar R = color[2];
+        // publish shared pointers/dims for this frame
+        S.gray = &gray;
+        S.gx   = &gx32f;
+        S.gy   = &gy32f;
+        S.rows = gray.rows;
+        S.cols = gray.cols;
 
-                uchar Y = static_cast<uchar>(0.299 * R + 0.587 * G + 0.114 * B);
-                gray.at<uchar>(y, x) = Y;
-            }
-        }
+        // ---- Pass 1: Gx ----
+        S.pass.store(Pass::SOBEL_X, std::memory_order_release);
+        pthread_barrier_wait(&S.start_barrier); // release workers for X
+        pthread_barrier_wait(&S.end_barrier);   // wait until X done
 
-        //Initialize X and Y output matrices
-        cv::Mat gx32f, gy32f;
+        // ---- Pass 2: Gy ----
+        S.pass.store(Pass::SOBEL_Y, std::memory_order_release);
+        pthread_barrier_wait(&S.start_barrier); // release workers for Y
+        pthread_barrier_wait(&S.end_barrier);   // wait until Y done
 
-        //Apply the respective kernels to X and Y output matrices
-        gx32f = convolution(gray,sobelX);
-        gy32f = convolution(gray,sobelY);
-
-        // Calculate the Magnitude 
-        cv::Mat mag32f;
+        // Now both Gx & Gy complete → compute magnitude & display on main
         cv::magnitude(gx32f, gy32f, mag32f);
+        // fixed gain (avoids per-frame pumping). Tune as desired.
+        mag32f.convertTo(mag8u, CV_8U, 0.5);
 
-        // Convert for display
-        cv::Mat gx8u, gy8u, mag8u;
-        cv::convertScaleAbs(gx32f, gx8u);                 // |Gx|
-        cv::convertScaleAbs(gy32f, gy8u);                 // |Gy|
-        cv::normalize(mag32f, mag32f, 0, 255, cv::NORM_MINMAX);
-        mag32f.convertTo(mag8u, CV_8U);
+        cv::imshow("Gray", gray);
+        cv::imshow("Sobel", mag8u);
 
-        // Show windows
-        cv::imshow(kWin, gray);
-        cv::imshow("Sobel Filter", mag8u);
-
-        // Handle keys and window events
-        int key = cv::waitKey(25);
-        if (key == 'q' || key == 27) { // quit on 'q' or ESC
-            break;
-        }
-        if (cv::getWindowProperty(kWin, cv::WND_PROP_AUTOSIZE) < 0) {
-            break; // window closed
-        }
+        int key = cv::waitKey(1);
+        if (key == 'q' || key == 27) break;
+        if (cv::getWindowProperty("Gray", cv::WND_PROP_VISIBLE) < 1) break;
     }
 
-    cap.release();
-    cv::destroyAllWindows();
+    // stop workers and join
+    S.pass.store(Pass::STOP, std::memory_order_release);
+    pthread_barrier_wait(&S.start_barrier); // wake for STOP
+    pthread_barrier_wait(&S.end_barrier);   // let them exit
+
+    for (int i = 0; i < NUM_THREADS; ++i) pthread_join(threads[i], nullptr);
+    pthread_barrier_destroy(&S.start_barrier);
+    pthread_barrier_destroy(&S.end_barrier);
     return 0;
 }
