@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cctype>
 #include <algorithm>
+#include <math.h>
 
 
 const int NUM_THREADS = 4; //Num Threads
@@ -13,7 +14,7 @@ static float SOBEL_X_KERNEL[9] = { -1,0,1, -2,0,2, -1,0,1 };
 static float SOBEL_Y_KERNEL[9] = { -1,-2,-1, 0,0,0, 1,2,1 };
 
 // All great things start with an FSM 
-enum class ComputeStages: int {GRAY_SCALE = 0, SOBEL_X = 1, SOBEL_Y  = 2, STOP = 3}; 
+enum class ComputeStages: int {GRAY_SCALE = 0, SOBEL_X = 1, SOBEL_Y  = 2, MAGNITUDE = 3, STOP = 4}; 
 
 // Shared data between main thread and worker threads
 struct FrameJob {
@@ -21,9 +22,10 @@ struct FrameJob {
     cv::Mat* grayFrame = nullptr; 
     cv::Mat* sobelXOut = nullptr; 
     cv::Mat* sobelYOut = nullptr; 
+    cv::Mat* mag32fOut = nullptr; 
     int imgRows = 0, imgCols= 0; 
 
-    std::atomic<ComputeStages> currentStage{ComputeStages::STOP}; 
+    std::atomic<ComputeStages> currentStage{ComputeStages::STOP}; //Shared Resource, so atomic required. 
 
     pthread_barrier_t startBarrier; 
     pthread_barrier_t endBarrier;
@@ -34,6 +36,22 @@ struct WorkerContext {
     FrameJob* job = nullptr; 
     int tid = 0; 
 };
+
+//Calculates the magnitude of GX and GY
+static inline void magnitude(const cv::Mat& gx32f, const cv::Mat& gy32f, cv::Mat& mag32f, int yStart, int yEnd){
+    const int rows = gx32f.rows,  cols = gx32f.cols;
+    const int ys = std::max(0, yStart); // Starting row, max to prevent clipping
+    const int ye = std::min(rows, yEnd); // Ending row, min to prevent clipping
+
+    for(int y = ys; y < ye; ++y){
+        const float* gX_row = gx32f.ptr<float>(y);
+        const float* gY_row = gy32f.ptr<float>(y); 
+        float* out = mag32f.ptr<float>(y); 
+        for (int x = 0; x < cols; ++x) {
+            out[x] = sqrt(gX_row[x] * gX_row[x] + gY_row[x] * gY_row[x]);
+        }
+    }
+}
 
 static inline void convolve3x3_rowptr(const cv::Mat& src, cv::Mat& dst,
                                       const float kernel[9], int yStart, int yEnd){
@@ -47,7 +65,7 @@ static inline void convolve3x3_rowptr(const cv::Mat& src, cv::Mat& dst,
         const uchar* prevRow = src.ptr<uchar>(y - 1);
         const uchar* currRow = src.ptr<uchar>(y);
         const uchar* nextRow = src.ptr<uchar>(y + 1);
-        float* outRow = dst.ptr<float>(y);
+        float* outRow = dst.ptr<float>(y); //Pointer to output row.
 
         //Convolve entire row with specified kernel 
         for (int x = border; x < cols - border; ++x) {
@@ -68,10 +86,10 @@ static inline void grayscale_calculation(const cv::Mat& bgr, cv::Mat& gray,int y
     for (int y = ys; y < ye; ++y) {
         const cv::Vec3b* in = bgr.ptr<cv::Vec3b>(y);
         uchar* out = gray.ptr<uchar>(y);
-    for (int x = 0; x < cols; ++x) {
-        const uchar B = in[x][0], G = in[x][1], R = in[x][2];
-        out[x] = static_cast<uchar>((R*77 + G*150 + B*29 + 128) >> 8);
-    }
+        for (int x = 0; x < cols; ++x) {
+            const uchar B = in[x][0], G = in[x][1], R = in[x][2];
+            out[x] = static_cast<uchar>((R*77 + G*150 + B*29 + 128) >> 8);
+        }
     }
 }
 
@@ -99,6 +117,8 @@ void* workerThread(void* arg){
             convolve3x3_rowptr(*job->grayFrame, *job->sobelYOut, SOBEL_Y_KERNEL, yStart, yEnd);
         } else if (stage == ComputeStages::GRAY_SCALE){
             grayscale_calculation(*job->bgrFrame,*job->grayFrame,yStart, yEnd);
+        } else if (stage == ComputeStages::MAGNITUDE){
+            magnitude(*job->sobelXOut, *job->sobelYOut, *job->mag32fOut ,yStart, yEnd);
         }
 
         // Signal that this thread has finished its slice
@@ -158,26 +178,31 @@ int main(int argc, char** argv){
         job.grayFrame = &gray;
         job.sobelXOut = &gX32f;
         job.sobelYOut = &gY32f;
+        job.mag32fOut = &mag32f; 
         job.imgRows   = gray.rows;
         job.imgCols   = gray.cols;
     
         // ---- Stage 1: Parallel GRAYSCALE ----
-        job.currentStage.store(ComputeStages::GRAY_SCALE, std::memory_order_release);
+        job.currentStage.store(ComputeStages::GRAY_SCALE, std::memory_order_release); //Thread safe stage changing
         pthread_barrier_wait(&job.startBarrier);
         pthread_barrier_wait(&job.endBarrier);
     
         // ---- Stage 2: Parallel SOBEL X ----
-        job.currentStage.store(ComputeStages::SOBEL_X, std::memory_order_release);
+        job.currentStage.store(ComputeStages::SOBEL_X, std::memory_order_release); //Thread safestage changing
         pthread_barrier_wait(&job.startBarrier);
         pthread_barrier_wait(&job.endBarrier);
     
         // ---- Stage 3: Parallel SOBEL Y ----
-        job.currentStage.store(ComputeStages::SOBEL_Y, std::memory_order_release);
+        job.currentStage.store(ComputeStages::SOBEL_Y, std::memory_order_release); //Thread safe stage changing
         pthread_barrier_wait(&job.startBarrier);
         pthread_barrier_wait(&job.endBarrier);
-    
+        
+        // ---- Stage 4: Parallel Magnitude ---
+        job.currentStage.store(ComputeStages::MAGNITUDE, std::memory_order_release); //Thread safe stage changing
+        pthread_barrier_wait(&job.startBarrier);
+        pthread_barrier_wait(&job.endBarrier);
+
         // Combine results & display
-        cv::magnitude(gX32f, gY32f, mag32f);
         mag32f.convertTo(mag8u, CV_8U, 0.5);
         cv::imshow("Sobel", mag8u);
 
